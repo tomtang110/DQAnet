@@ -90,7 +90,7 @@ class BertForDQA(BertPreTrainedModel):
         sup_end_pro = sup_end_pro.squeeze(-1)
         ans_start_pro = ans_start_pro.squeeze(-1)
         ans_end_pro = ans_end_pro.squeeze(-1)
-        if sup_start_labels != None:
+        if sup_start_labels is not None:
             soft_max = torch.nn.LogSoftmax(dim = 1)
             sup_start_loss = -torch.sum(sup_start_labels*soft_max(sup_start_pro))
             sup_end_loss = -torch.sum(sup_end_labels*soft_max(sup_end_pro))
@@ -100,6 +100,7 @@ class BertForDQA(BertPreTrainedModel):
             ans_loss = torch.mean((ans_start_loss+ans_end_loss))/2
             return sup_loss, ans_loss,hidden_output
         else:
+            attention_mask = attention_mask.float()
             sup_start_pre = sup_start_pro * attention_mask
             sup_end_pre = sup_end_pro * attention_mask
             for n in range(batch_size):
@@ -138,7 +139,8 @@ class D_attention(nn.Module):
             self.layers.append(DQA(input_sizes[0]))
         self.relu = nn.ReLU()
     def forward(self, final_result):
-        x = torch.zeros_like(final_result)
+        final_size = final_result.size()
+        x = torch.zeros(final_size[-1])
         for i, layer in enumerate(self.layers):
             x += layer(final_result)
         x = self.relu(x/(i+1))
@@ -156,19 +158,19 @@ class DQA(nn.Module):
     def __init__(self,input_size):
         super(DQA, self).__init__()
         self.B_ij = nn.Linear(2*input_size,1)
-        self.leakyrelu = nn.LeakyReLU()
     def forward(self,attention_mx):
         mx_size = attention_mx.size()
         i_mx = attention_mx[0,:].squeeze(0)
-        final_result = torch.zeros(mx_size[-1])
         alph = torch.zeros(mx_size[0])
         for j in range(mx_size[0]):
             ij_cat = (torch.cat([i_mx,attention_mx[j,:]],0)).view(-1)
-            B_ij = self.leakyrelu(self.B_ij(ij_cat))
+            B_ij = self.B_ij(ij_cat)
             alph[j] = B_ij
-        for j in range(mx_size[0]):
-            pro_j = torch.exp(alph[j]) / torch.sum(torch.exp(alph))
-            final_result += attention_mx[j,:] * pro_j
+        leakyrelu = nn.LeakyReLU()
+        alph = leakyrelu(alph)
+        soft_max = nn.Softmax(dim=0)
+        pro_j = soft_max(alph).unsqueeze(0)
+        final_result = torch.sum(attention_mx * torch.t(pro_j),dim=0)
         return final_result
 
 
@@ -180,12 +182,12 @@ class DQA_graph(nn.Module):
     def __init__(self,input_size):
         super(DQA_graph,self).__init__()
         self.sentence_level = MLP((input_size[0],input_size[0],1))
-        self.dqa = D_attention([input_size[1], input_size[-1]])
+        self.dqa = D_attention([input_size[2], input_size[-1]])
         self.yes_no = MLP((input_size[1],input_size[1],1))
-        self.pr_node = MLP((input_size[1],input_size[1],2))
+        self.pr_node = MLP((input_size[1],input_size[1],2*input_size[1]))
     def forward(self, args,data_set,model,device,pred_mode=False):
         token_ids, segment_ids, input_mask, sup_start_labels, sup_end_labels, \
-        ans_start_labels, ans_end_labels, question_type, answer_id, graph = generate_data(data_set)
+        ans_start_labels, ans_end_labels, question_type, answer_id, graph = generate_data(args=args,data=data_set,pre=pred_mode)
 
         sup_loss,ans_loss,hidden_output = model(args,token_ids,segment_ids,input_mask,sup_start_labels,sup_end_labels
                                                 ,ans_start_labels,ans_end_labels)
@@ -203,7 +205,7 @@ class DQA_graph(nn.Module):
                     q_count = 0
                     for cor_node in own_graph[each_node]:
                         q_count += 1
-                        question_vector += hidden_output[cor_node[0],:]
+                        question_vector += hidden_output[cor_node[0],:args.max_s_len]
                     question_vector = question_vector/q_count
                     attention_mx[0,:] = question_vector
                 else:
@@ -217,6 +219,7 @@ class DQA_graph(nn.Module):
                 node_att = self.dqa(attention_mx)
                 if each_node[0] != -1:
                     new_hidden_output[each_node[0],(each_node[1]+1) * args.max_s_len:(each_node[1] + 2) * args.max_s_len] = node_att
+                    # print(new_hidden_output[each_node[0],:])
             hidden_output = new_hidden_output
         if not pred_mode:
             if question_type == 1:
@@ -228,7 +231,7 @@ class DQA_graph(nn.Module):
 
                 return ans_loss,sup_loss,final_loss
             else:
-                pred = self.pr_node(hidden_output)
+                pred = self.pr_node(hidden_output).view(-1,args.max_p_len,2)
                 ans_start_pro, ans_end_pro = pred.split(1, dim=-1)
 
                 ans_start_pro = ans_start_pro.squeeze(-1)
@@ -245,13 +248,16 @@ class DQA_graph(nn.Module):
             if question_type == 1:
                 soft_max = torch.nn.Softmax(dim=0)
                 ans_yes_no = self.yes_no(hidden_output).squeeze(-1)
-                ans_yes_no = torch.nn.Sigmoid(torch.sum(soft_max(ans_yes_no) * ans_yes_no))
+                sigmoid = torch.nn.Sigmoid()
+                ans_yes_no = sigmoid(torch.sum(soft_max(ans_yes_no) * ans_yes_no))
                 return (sup_loss,ans_yes_no.item()>0.5)
             else:
-                pred = self.pr_node(hidden_output)
+                pred = self.pr_node(hidden_output).view(-1,args.max_p_len,2)
                 ans_start_pro, ans_end_pro = pred.split(1, dim=-1)
-                ans_start_pre = ans_start_pro * input_mask
-                ans_end_pre = ans_end_pro * input_mask
+                ans_start_pro = ans_start_pro.squeeze(-1)
+                ans_end_pro = ans_end_pro.squeeze(-1)
+                ans_start_pre = ans_start_pro * (input_mask.float())
+                ans_end_pre = ans_end_pro * (input_mask.float())
                 for n in range(batch_size):
                     ans_start_standard = torch.sum(ans_start_pre[n, 0:args.max_s_len]) / torch.sum(
                         input_mask[n, 0:args.max_s_len])
@@ -279,10 +285,13 @@ class DQA_graph(nn.Module):
                             ans_sentence.append((n, sen,ans_cur))
                 if len(ans_sentence) > 1:
                     ans_sentence = max(ans_sentence,key=lambda x:x[0])
-                if ans_sentence != []:
+                elif len(ans_sentence) == 1:
                     ans_sentence = ans_sentence[0]
-                    left_a = torch.argmax(ans_start_pre[ans_sentence[0],ans_sentence[1]*args.max_s_len:args.max_s_len * (ans_sentence[1] + 1)])
-                    right_a = torch.argmax(ans_end_pre[ans_sentence[0],ans_sentence[1]*args.max_s_len:args.max_s_len * (ans_sentence[1] + 1)])
+                if ans_sentence != []:
+                    ans_f_start= ans_start_pre[ans_sentence[0],ans_sentence[1]*args.max_s_len:args.max_s_len * (ans_sentence[1] + 1)]
+                    left_a = torch.argmax(ans_f_start.view(-1))
+                    ans_f_end = ans_end_pre[ans_sentence[0],ans_sentence[1]*args.max_s_len:args.max_s_len * (ans_sentence[1] + 1)]
+                    right_a = torch.argmax(ans_f_end.view(-1))
                     return sup_loss,[ans_sentence[0],ans_sentence[1],left_a.item(),right_a.item()]
                 else:
                     return sup_loss,[]

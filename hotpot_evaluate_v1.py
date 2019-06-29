@@ -81,7 +81,6 @@ def update_sp(metrics, prediction, gold):
     return em, prec, recall
 
 def eval(prediction_file, gold_file):
-    logger = logging.getLogger("D-QA")
     with open(prediction_file) as f:
         prediction = json.load(f)
     with open(gold_file) as f:
@@ -124,8 +123,7 @@ def eval(prediction_file, gold_file):
     for k in metrics.keys():
         metrics[k] /= N
 
-    print(metrics)
-    logger.info('{}'.format(metrics))
+    return metrics
 
 if __name__ == '__main__':
     eval(sys.argv[1], sys.argv[2])

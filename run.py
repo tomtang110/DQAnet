@@ -32,7 +32,7 @@ def parse_args():
 
     train_settings = parser.add_argument_group('train settings')
     train_settings.add_argument('--mode', type=str,
-                                default='fine-tune',
+                                default='D-graph',
                                 help='fine-tune or D-graph')
     train_settings.add_argument('--Bert_model', type=str,
                                default='bert-base-uncased',
@@ -118,7 +118,7 @@ def train_model(args,dataset,model,device,D_model = None):
         for step, batch in enumerate(tqdm_obj):
             if args.mode == 'fine-tune':
                 batch = tuple(t.to(device) for t in batch)
-                sup_loss, ans_loss = model(args,*batch)
+                sup_loss, ans_loss,_ = model(args,*batch)
                 loss = ans_loss + sup_loss
             else:
                 ans_loss, sup_loss, node_loss = D_model(args,batch, model, device)
@@ -162,16 +162,13 @@ def train_model(args,dataset,model,device,D_model = None):
                     saved_dict = {'bert-params': model.module.state_dict()}
                     torch.save(saved_dict, output_model_file)
             else:
-                if step % 5000 == 0:
-                    ans_f1_score, ans_em_score, sup_f1_score, sup_em_score,_ = evaluate_rd(args,dataset[1],model,D_model,device)
-                    logger.info('ans_EM: {}, ans_f1: {}, sup_EM: {}, sup_f1: {}'.format(ans_em_score, ans_f1_score,
-                                                                                        sup_em_score, sup_f1_score))
-                    if (ans_f1_score+sup_f1_score)/2 > f1_s_max:
+                if step % 1000 == 0:
+                    metircs = evaluate_rd(args,dataset[1],model,D_model,device)
+                    if metircs['joint_f1'] > f1_s_max:
                         output_model_file = './models/DQA_model.bin.tmp'
                         saved_dict = {'bert-params': model.module.state_dict()}
                         saved_dict['dg-params'] = D_model.state_dict()
                         torch.save(saved_dict, output_model_file)
-                        f1_s_max = (ans_f1_score+sup_f1_score)/2
 
     return (model,D_model)
 
@@ -205,10 +202,10 @@ def train(args):
         logger.info('Loading model from {}'.format(os.path.join(args.model_dir,'bert-base-uncased.bin.tmp')))
         model_state_dict = torch.load(os.path.join(args.model_dir,'bert-base-uncased.bin.tmp'))
         model = BertForDQA.from_pretrained(args.Bert_model, state_dict=model_state_dict['bert-params'])
-        d_model = DQA_graph(model.config.hidden_size)
+        d_model = DQA_graph((model.config.hidden_size, args.max_p_len, args.max_s_len, args.at_head))
     else:
         model = BertForDQA.from_pretrained(args.Bert_model,cache_dir=PYTORCH_PRETRAINED_BERT_CACHE / 'distributed_{}'.format(-1))
-        d_model = DQA_graph((model.config.hidden_size,args.max_p_len,args.at_head))
+        d_model = DQA_graph((model.config.hidden_size,args.max_p_len,args.max_s_len,args.at_head))
 
     model = torch.nn.DataParallel(model, device_ids=range(torch.cuda.device_count()))
     _,_ = train_model(args,dataset,model,device,D_model=d_model)
@@ -227,7 +224,7 @@ def evaluate_rd(args,dev_set,model,d_model,device):
         original_c = dev_set[step]
         sup_list,ans_list = d_model(args,batch, model, device,pred_mode=True)
         context = original_c.context
-        tokens = original_c.token_set
+        tokens = original_c.total_token
         _id = original_c.t_id
         sup_answer = []
         for each_s in sup_list:
@@ -235,16 +232,22 @@ def evaluate_rd(args,dev_set,model,d_model,device):
 
         if isinstance(ans_list,bool):
             node_answer = ['no','yes'][int(ans_list)]
+        elif ans_list == []:
+            node_answer = ''
         else:
-            node_answer = ' '.join(tokens[ans_list[0]][ans_list[1]][ans_list[2]:ans_list[3]+1])
+            node_answer = ' '.join(tokens[ans_list[0]][(ans_list[1])*args.max_s_len:(ans_list[1]+1)*args.max_s_len][ans_list[2]:ans_list[3]+1])
 
         sp[_id] = sup_answer
         answer[_id] = node_answer
     final_answer = {'answer':answer,'sp':sp}
-    with open(os.path.join(args.resutl_dir,'dev_result.json'),'w') as fout:
+    with open(os.path.join(args.result_dir,'dev_result.json'),'w') as fout:
         json.dump(final_answer,fout)
 
-    eval(os.path.join(args.resutl_dir,'dev_result.json'),args.dev_files[0])
+    metircs = eval(os.path.join(args.result_dir,'dev_result.json'),args.dev_files[0])
+    logger.info('EM: {}, F1: {}, sup_EM: {}, sup_F1: {}, joint_EM: {} joint_F1: {}'.format(
+        metircs['em'],metircs['f1'],metircs['sp_em'],metircs['sp_f1'],metircs['joint_em'],metircs['joint_f1']
+    ))
+    return metircs
 
 
 
@@ -263,7 +266,7 @@ def evaluate(args):
     device = torch.device('cpu') if not torch.cuda.is_available() else torch.device('cuda')
     model_state_dict = torch.load(os.path.join(args.model_dir, 'DQA_model.bin.tmp'))
     model = BertForDQA.from_pretrained(args.Bert_model, state_dict=model_state_dict['bert-params'])
-    d_model = DQA_graph(model.config.hidden_size)
+    d_model = DQA_graph((model.config.hidden_size, args.max_p_len, args.max_s_len, args.at_head))
     d_model.load_state_dict(model_state_dict['dg-params'])
     model = torch.nn.DataParallel(model, device_ids=range(torch.cuda.device_count()))
     model.to(device).eval()
@@ -284,7 +287,7 @@ def predict(args):
     device = torch.device('cpu') if not torch.cuda.is_available() else torch.device('cuda')
     model_state_dict = torch.load(os.path.join(args.model_dir, 'DQA_model.bin.tmp'))
     model = BertForDQA.from_pretrained(args.Bert_model, state_dict=model_state_dict['bert-params'])
-    d_model = DQA_graph(model.config.hidden_size)
+    d_model = DQA_graph((model.config.hidden_size, args.max_p_len, args.max_s_len, args.at_head))
     d_model.load_state_dict(model_state_dict['dg-params'])
     model = torch.nn.DataParallel(model, device_ids=range(torch.cuda.device_count()))
     model.to(device).eval()
@@ -311,7 +314,7 @@ def predict(args):
         sp[_id] = sup_answer
         answer[_id] = node_answer
     final_answer = {'answer': answer, 'sp': sp}
-    with open(os.path.join(args.resutl_dir, 'hotpot_test_fullwiki_v1_refine.json_pred'), 'w') as fout:
+    with open(os.path.join(args.result_dir, 'hotpot_test_fullwiki_v1_refine.json_pred'), 'w') as fout:
         json.dump(final_answer, fout)
 
 

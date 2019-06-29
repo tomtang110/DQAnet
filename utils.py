@@ -13,7 +13,7 @@ GENERAL_WD = ['is', 'are', 'am', 'was', 'were', 'have', 'has', 'had', 'can', 'co
               'shall', 'will', 'should', 'would', 'do', 'does', 'did', 'may', 'might', 'must', 'ought', 'need', 'dare']
 GENERAL_WD += [x.capitalize() for x in GENERAL_WD]
 GENERAL_WD = re.compile(' |'.join(GENERAL_WD))
-FIELDS = ['token_ids', 'sup_start_labels', 'sup_end_labels', 'ans_start_labels', 'ans_end_labels', 'segment_ids', 'question_type','answer_id', '_id','graph']
+FIELDS = ['token_ids', 'sup_start_labels', 'sup_end_labels', 'ans_start_labels', 'ans_end_labels', 'segment_ids', 'question_type','answer_id','graph']
 
 
 class DQA(object):
@@ -190,7 +190,7 @@ class Data_process(object):
                 count = 0
                 for data in tqdm(dataset):
                     try:
-                        self.dev_set.append(preprocessed_data(args, tokenizer, data))
+                        self.dev_set.append(preprocessed_data(args, tokenizer, data,if_dev=1))
                     except Exception as error:
                         count += 1
                 self.logger.info('There are {} questions excluded'.format(count))
@@ -215,7 +215,8 @@ def test_preprocessed_data(args,tokenizer,data):
         token_question = token_question[:args.max_s_len]
     question_type = judge_question_type(data['question'])
     context = data['context']
-    token_id
+    token_id = data['_id']
+    total_token = []
     for title_n, para in data['context']:
         token_set = [] + token_question
         segment_id = [0] * len(token_set)
@@ -243,16 +244,25 @@ def test_preprocessed_data(args,tokenizer,data):
             assert len(token_set) <= args.max_p_len
         token_ids.append(tokenizer.convert_tokens_to_ids(token_set))
         segment_ids.append(segment_id)
-        question_type = [[question_type]*args.max_p_len]*10
+        total_token.append(token_set)
     graph = dict()
     for each_node in data['graph']:
-        graph[eval(each_node)] = data['graph'][each_node]
-    _id = data['_id']
+        each_key = eval(each_node)
+        if each_key[1] >= args.max_s_num:
+            continue
+        each_items = data['graph'][each_node]
+        each_new_items = []
+        for each_item in each_items:
+            if each_item[1] >= args.max_s_num:
+                continue
+            each_new_items.append(each_item)
+        graph[each_key] = each_new_items
+
     one_sample = DQA()
     test_filed = [FIELDS[0],FIELDS[5],FIELDS[6],FIELDS[8],FIELDS[9]]
     for field in test_filed:
         setattr(one_sample, field, eval(field))
-    setattr(one_sample, 'token_set', eval('token_set'))
+    setattr(one_sample, 'total_token', eval('total_token'))
     setattr(one_sample, 'context', eval('context'))
     setattr(one_sample, 'token_id', eval('token_id'))
     return one_sample
@@ -277,6 +287,7 @@ def preprocessed_data(args,tokenizer,data,if_dev = 0):
         answer_id.append(int(data['answer'] == 'yes'))
     context = data['context']
     t_id = data['_id']
+    total_token = []
     for title_n, para in data['context']:
         token_set = [] + token_question
         segment_id = [0] * len(token_set)
@@ -336,22 +347,34 @@ def preprocessed_data(args,tokenizer,data,if_dev = 0):
         sup_end_labels.append(sup_end_label)
         ans_start_labels.append(ans_start_label)
         ans_end_labels.append(ans_end_label)
+        if if_dev:
+            total_token.append(token_set)
 
     graph = dict()
+
     for each_node in data['graph']:
-        graph[eval(each_node)] = data['graph'][each_node]
+        each_key = eval(each_node)
+        if each_key[1] >= args.max_s_num:
+            continue
+        each_items = data['graph'][each_node]
+        each_new_items = []
+        for each_item in each_items:
+            if each_item[1] >= args.max_s_num:
+                continue
+            each_new_items.append(each_item)
+        graph[each_key] = each_new_items
     one_sample = DQA()
     for field in FIELDS:
         setattr(one_sample, field, eval(field))
     if if_dev:
-        setattr(one_sample,'token_set',eval('token_set'))
+        setattr(one_sample,'total_token',eval('total_token'))
         setattr(one_sample,'context',eval('context'))
         setattr(one_sample,'t_id',eval('t_id'))
     return one_sample
 
 def generate_data(args,data,l=None,r=None,pre=False):
     if l is None:
-        l, r = 0, len(data.ids)
+        l, r = 0, len(data.token_ids)
     num_in = r - l
     length = len(data.token_ids[0])
     token_id = torch.zeros((num_in,length),dtype = torch.long)
@@ -362,13 +385,13 @@ def generate_data(args,data,l=None,r=None,pre=False):
     segment_ids = torch.zeros((num_in,length),dtype = torch.long)
     input_mask = torch.zeros((num_in,length),dtype = torch.long)
     for i in range(l,r):
-        token_id[i,:] = torch.tensor(data.token_ids[i],dtype=torch.long)
-        sup_start_labels[i,:] = torch.tensor(data.sup_start_labels[i])
-        sup_end_labels[i,:] = torch.tensor(data.sup_end_labels[i])
-        ans_start_labels[i,:] = torch.tensor(data.ans_start_labels[i])
-        ans_end_labels[i,:] = torch.tensor(data.ans_start_labels[i])
-        segment_ids[i,:] = torch.tensor(data.segment_ids[i])
-        input_mask[i,:] = (token_id[i,:] > 0).long()
+        token_id[i-l,:] = torch.tensor(data.token_ids[i],dtype=torch.long)
+        sup_start_labels[i-l,:] = torch.tensor(data.sup_start_labels[i])
+        sup_end_labels[i-l,:] = torch.tensor(data.sup_end_labels[i])
+        ans_start_labels[i-l,:] = torch.tensor(data.ans_start_labels[i])
+        ans_end_labels[i-l,:] = torch.tensor(data.ans_start_labels[i])
+        segment_ids[i-l,:] = torch.tensor(data.segment_ids[i])
+        input_mask[i-l,:] = (token_id[i-l,:] > 0).long()
     if pre:
         question_type = data.question_type
         graph = data.graph
